@@ -12,7 +12,8 @@
                 "s3": {
                     "host": "127.0.0.1",
                     "port": 8000,
-                    "transport": "https"
+                    "transport": "https",
+                    "maxRetries": 100,
                 },
                 "auth": {
                     "type": "account",
@@ -38,6 +39,7 @@
                     "host": "127.0.0.2",
                     "port": 9000,
                     "transport": "https"
+                    "maxRetries": 100,
                 },
                 "auth": {
                     "type": "account",

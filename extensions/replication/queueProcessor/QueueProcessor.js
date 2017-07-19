@@ -222,7 +222,7 @@ class QueueProcessor {
             VersionId: entry.getEncodedVersionId() });
         const incomingMsg = req.createReadStream();
         req.on('error', err => {
-            this.log.error('error response getting data from S3',
+            this.log.error('an error occurred when getting data from S3',
                            { entry: entry.getLogInfo(),
                              origin: this.sourceConfig.s3,
                              error: err, httpStatus: err.statusCode });
@@ -248,7 +248,7 @@ class QueueProcessor {
             Body: sourceStream,
         }, (err, data) => {
             if (err) {
-                this.log.error('error response from destination S3 server',
+                this.log.error('an error occurred when putting data to S3',
                                { entry: entry.getLogInfo(),
                                  origin: this.destConfig.s3,
                                  error: err });
@@ -258,7 +258,7 @@ class QueueProcessor {
         });
     }
 
-    _putMetaData(where, entry, cb) {
+    _putMetadata(where, entry, cb) {
         this.log.debug('putting metadata',
                        { where, entry: entry.getLogInfo(),
                          replicationStatus: entry.getReplicationStatus() });
@@ -273,7 +273,7 @@ class QueueProcessor {
             Body: mdBlob,
         }, (err, data) => {
             if (err) {
-                this.log.error('error response from S3',
+                this.log.error('an error occurred when putting metadata to S3',
                                { entry: entry.getLogInfo(),
                                  origin: this.destConfig.s3,
                                  error: err });
@@ -296,6 +296,7 @@ class QueueProcessor {
             sslEnabled: true,
             s3ForcePathStyle: true,
             signatureVersion: 'v4',
+            maxRetries: this.sourceConfig.s3.maxRetries,
         });
         this.backbeatSource = new BackbeatClient({
             endpoint: `${this.sourceConfig.s3.transport}://` +
@@ -303,6 +304,7 @@ class QueueProcessor {
             credentials:
             this.s3sourceAuthManager.getCredentialProvider(),
             sslEnabled: true,
+            maxRetries: this.sourceConfig.s3.maxRetries,
         });
 
         this.backbeatDest = new BackbeatClient({
@@ -311,10 +313,11 @@ class QueueProcessor {
             credentials:
             this.s3destAuthManager.getCredentialProvider(),
             sslEnabled: true,
+            maxRetries: this.destConfig.s3.maxRetries,
         });
     }
 
-    _processEntry(kafkaEntry, done) {
+    _processKafkaEntry(kafkaEntry, done) {
         const sourceEntry = QueueEntry.createFromKafkaEntry(kafkaEntry);
         const destEntry = sourceEntry.toReplicaEntry();
 
@@ -326,51 +329,19 @@ class QueueProcessor {
         this.log.debug('processing entry',
                        { entry: sourceEntry.getLogInfo() });
 
-        const _doneProcessingCompletedEntry = err => {
-            if (err) {
-                this.log.error('an error occurred while writing ' +
-                               'replication status to COMPLETED',
+        const _handleReplicationOutcome = err => {
+            if (!err) {
+                this.log.debug('replication failed permanently for object, ' +
+                               'updating replication status to FAILED',
                                { entry: sourceEntry.getLogInfo() });
-                return done(err);
-            }
-            this.log.info('entry replicated successfully',
-                          { entry: sourceEntry.getLogInfo() });
-            return done();
-        };
-
-        const _doneProcessingFailedEntry = err => {
-            if (err) {
-                this.log.error('an error occurred while writing ' +
-                               'replication status to FAILED',
-                               { entry: sourceEntry.getLogInfo() });
-                return done(err);
-            }
-            this.log.info('replication status set to FAILED',
-                          { entry: sourceEntry.getLogInfo() });
-            return done();
-        };
-
-        const _writeReplicationStatus = err => {
-            if (err) {
-                this.log.warn('replication failed for object',
-                              { entry: sourceEntry.getLogInfo(),
-                                error: err });
-                if (this.backbeatSource !== null) {
-                    return this._putMetaData('source',
-                                             sourceEntry.toFailedEntry(),
-                                             _doneProcessingFailedEntry);
-                }
-                this.log.info('replication status update skipped',
-                              { entry: sourceEntry.getLogInfo() });
-                return done();
-                // TODO: queue entry back in kafka for later retry
+                return this._updateReplicationStatus(
+                    sourceEntry.toFailedEntry(), done);
             }
             this.log.debug('replication succeeded for object, updating ' +
                            'source replication status to COMPLETED',
                            { entry: sourceEntry.getLogInfo() });
-            return this._putMetaData('source',
-                                     sourceEntry.toCompletedEntry(),
-                                     _doneProcessingCompletedEntry);
+            return this._updateReplicationStatus(
+                sourceEntry.toCompletedEntry(), done);
         };
 
         if (sourceEntry.isDeleteMarker()) {
@@ -385,9 +356,9 @@ class QueueProcessor {
                 // put metadata in target bucket
                 (accountAttr, next) => {
                     // TODO check that bucket role matches role in metadata
-                    this._putMetaData('target', destEntry, next);
+                    this._putMetadata('target', destEntry, next);
                 },
-            ], _writeReplicationStatus);
+            ], _handleReplicationOutcome);
         }
         return async.waterfall([
             // get data stream from source bucket
@@ -410,9 +381,37 @@ class QueueProcessor {
             // target bucket
             (location, next) => {
                 destEntry.setLocation(location);
-                this._putMetaData('target', destEntry, next);
+                this._putMetadata('target', destEntry, next);
             },
-        ], _writeReplicationStatus);
+        ], _handleReplicationOutcome);
+    }
+
+    _updateReplicationStatus(updatedSourceEntry, done) {
+        const _doneUpdate = err => {
+            if (err) {
+                this.log.error(
+                    'an error occurred when writing replication status',
+                    { entry: updatedSourceEntry.getLogInfo(),
+                      replicationStatus:
+                      updatedSourceEntry.getReplicationStatus() });
+                return done();
+            }
+            this.log.info('replication status updated',
+                          { entry: updatedSourceEntry.getLogInfo(),
+                            replicationStatus:
+                            updatedSourceEntry.getReplicationStatus() });
+            return done();
+        };
+
+        if (this.backbeatSource !== null) {
+            return this._putMetadata('source',
+                                     updatedSourceEntry, _doneUpdate);
+        }
+        this.log.info('replication status update skipped',
+                      { entry: updatedSourceEntry.getLogInfo(),
+                        replicationStatus:
+                        updatedSourceEntry.getReplicationStatus() });
+        return done();
     }
 
     start() {
@@ -423,7 +422,7 @@ class QueueProcessor {
             groupId: this.repConfig.queueProcessor.groupId,
             concurrency: 1, // replication has to process entries in
                             // order, so one at a time
-            queueProcessor: this._processEntry.bind(this),
+            queueProcessor: this._processKafkaEntry.bind(this),
         });
         consumer.on('error', () => {});
         consumer.subscribe();

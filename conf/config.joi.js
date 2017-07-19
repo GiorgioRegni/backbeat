@@ -23,6 +23,7 @@ const joiSchema = {
                 s3: hostPortJoi.keys({
                     transport: joi.alternatives().try('http', 'https')
                         .default('http'),
+                    maxRetries: joi.number().default(100),
                 }).required(),
                 auth: authJoi.required(),
                 logSource: joi.alternatives()
@@ -38,6 +39,7 @@ const joiSchema = {
                 s3: hostPortJoi.keys({
                     transport: joi.alternatives().try('http', 'https')
                         .default('http'),
+                    maxRetries: joi.number().default(100),
                 }).required(),
                 auth: authJoi.required(),
                 certFilePaths: joi.object({
